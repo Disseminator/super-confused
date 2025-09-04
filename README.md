@@ -1,86 +1,47 @@
-![super-confused](super-confused-github-banner.png)
-
 # super-confused
 
-A next-gen dependency confusion analysis tool that identifies confusion opportunities in source code and SBOM files.
-super-confused works on multiple package manifest and SBOM file formats, either locally, or remotely.
+一款下一代依赖混淆分析工具，用于识别源代码和SBOM文件中可能存在的依赖混淆机会。
+super-confused 支持多种包清单和SBOM文件格式，可在本地或远程运行。
 
-I've been using [Confused](https://github.com/visma-prodsec/confused) for years, but really wanted a tool that supported more languages and SBOMs.  Also, I wanted to refactor this in Javascript so I can publish it as an NPM package.  So, super-confused was born!
+## 功能
 
-## Features
+- **支持17种文件格式**：package.json、requirements.txt、pyproject.toml、go.mod、Cargo.toml、composer.json、Gemfile、pom.xml、build.gradle、yarn.lock、package-lock.json、bom.json、sbom.json、bom.xml、sbom.xml、go.sum
+- **远程扫描**：直接扫描 GitHub/GitLab URL 中的文件
+- **SBOM支持**：支持 CycloneDX 和 SPDX 格式（JSON/XML）
+- **实时验证**：检查包在公共注册表中的存在性
+- **JSON输出**：提供机器可读的结果，方便集成到 CI/CD 流程
 
-- **17 file format support**: package.json, requirements.txt, pyproject.toml, go.mod, Cargo.toml, composer.json, Gemfile, pom.xml, build.gradle, yarn.lock, package-lock.json, bom.json, sbom.json, bom.xml, sbom.xml, go.sum
-- **Remote scanning**: Scan files directly from GitHub/GitLab URLs
-- **SBOM support**: CycloneDX and SPDX formats (JSON/XML)
-- **Real-time verification**: Checks package existence across public registries
-- **JSON output**: Machine-readable results for CI/CD integration
+## 安装
 
-## Installation
-
-### NPM Package
+### NPM 包
 
 ```bash
 npm install super-confused
 ```
 
-### Source installation
-
-```bash
+### 源码安装
+```shell
 git clone https://github.com/6mile/super-confused.git
 cd super-confused
 chmod +x super-confused.js
 ```
 
-## Usage
-
-```bash
-# Scan local file
+## 使用方法
+```text
+# 扫描本地文件
 ./super-confused.js package.json
 
-# Scan directory
+# 扫描目录
 ./super-confused.js .
 
-# Scan remote file
+# 扫描远程文件
 ./super-confused.js https://github.com/user/repo/blob/main/package.json
 
-# JSON output
+# JSON 输出
 ./super-confused.js --json package.json
 ```
 
-## Output
-
-**Standard mode** shows detailed vulnerability information with risk levels:
-```bash
-Scanning ./package.json for dependency confusion opportunities...
-@your-company/internal-package-frontend (npm) in ./package.json
-Version: 1.0.0
-This package may not exist in the public registry!
-
-@your-company/internal-package-infrastructure (npm) in ./package.json
-Version: 1.0.0
-This package may not exist in the public registry!
-
-private-package (npm) in ./package.json
-Version: ^2.903.0
-This package may not exist in the public registry!
-```
-
-**JSON mode** outputs structured data:
-```json
-{
-  "name": "super-confused",
-  "description": "Identify dependency confusion opportunities in source code and SBOM files.",
-  "author": "6mile",
-  "dependency-confused-packages": [
-    {
-      "@yourcompany/internal-package": "1.0.0"
-    }
-  ]
-}
-```
-
-## Supported Ecosystems
-
+## 支持的生态系统
 - npm (Node.js)
 - PyPI (Python)
 - Cargo (Rust)
@@ -88,7 +49,3 @@ This package may not exist in the public registry!
 - RubyGems (Ruby)
 - Maven (Java)
 - Go modules
-
-## Author
-
-Created by 6mile

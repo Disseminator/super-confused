@@ -909,7 +909,7 @@ class SuperConfused {
                 const output = {
                     "name": "super-confused",
                     "description": "Identify dependency confusion in your source code",
-                    "author": "6mile",
+                    "author": "KeepHack1ng",
                     "dependency-confused-packages": vulnerabilities
                 };
                 console.log(JSON.stringify(output, null, 2));
