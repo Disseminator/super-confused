@@ -2,8 +2,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const https = require('https');
 const { promisify } = require('util');
+const urlModule = require('url');
 
 const readFile = promisify(fs.readFile);
 const readdir = promisify(fs.readdir);
@@ -41,18 +43,21 @@ class SuperConfused {
             'bom.xml': this.scanSbomXml,
             'sbom.xml': this.scanSbomXml
         };
+        this.userAgent = 'SuperConfused/1.0';
+        this.timeout = 10000; // Unified timeout: 10 seconds
+        this.maxRedirects = 5; // Prevent infinite redirect loops
     }
 
     async scan(targetPath) {
         if (!this.jsonMode) {
             console.log(`Scanning ${targetPath} for dependency confusion opportunities...`);
         }
-        
+
         if (targetPath.startsWith('http://') || targetPath.startsWith('https://')) {
             await this.scanUrl(targetPath);
         } else {
             const isDirectory = (await stat(targetPath)).isDirectory();
-            
+
             if (isDirectory) {
                 await this.scanDirectory(targetPath);
             } else {
@@ -66,7 +71,7 @@ class SuperConfused {
 
     async scanUrl(url) {
         try {
-            // Convert GitHub blob URLs to raw URLs
+            // Convert GitHub/GitLab blob URLs to raw URLs
             let rawUrl = url;
             if (url.includes('github.com') && url.includes('/blob/')) {
                 rawUrl = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/');
@@ -76,7 +81,7 @@ class SuperConfused {
 
             const content = await this.fetchUrl(rawUrl);
             const fileName = this.getFileNameFromUrl(url);
-            
+
             if (this.supportedFiles[fileName]) {
                 const scanner = this.supportedFiles[fileName].bind(this);
                 await scanner(url, content);
@@ -98,10 +103,23 @@ class SuperConfused {
         return fileName;
     }
 
-    fetchUrl(url) {
+    fetchUrl(url, redirectCount = 0) {
+        if (redirectCount > this.maxRedirects) {
+            throw new Error('Max redirects exceeded');
+        }
+
+        const parsedUrl = urlModule.parse(url);
+        const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
         return new Promise((resolve, reject) => {
-            const request = https.get(url, { timeout: 10000 }, (response) => {
-                if (response.statusCode === 200) {
+            const request = protocol.get(url, {
+                timeout: this.timeout,
+                headers: { 'User-Agent': this.userAgent }
+            }, (response) => {
+                if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                    // Handle redirects (301, 302, 303, 307, 308)
+                    this.fetchUrl(response.headers.location, redirectCount + 1).then(resolve).catch(reject);
+                } else if (response.statusCode === 200) {
                     let data = '';
                     response.on('data', chunk => {
                         data += chunk;
@@ -109,9 +127,6 @@ class SuperConfused {
                     response.on('end', () => {
                         resolve(data);
                     });
-                } else if (response.statusCode === 302 || response.statusCode === 301) {
-                    // Handle redirects
-                    this.fetchUrl(response.headers.location).then(resolve).catch(reject);
                 } else {
                     reject(new Error(`HTTP ${response.statusCode}`));
                 }
@@ -128,11 +143,11 @@ class SuperConfused {
     async scanDirectory(dirPath) {
         try {
             const entries = await readdir(dirPath);
-            
+
             for (const entry of entries) {
                 const fullPath = path.join(dirPath, entry);
                 const stats = await stat(fullPath);
-                
+
                 if (stats.isDirectory() && !entry.startsWith('.') && entry !== 'node_modules') {
                     await this.scanDirectory(fullPath);
                 } else if (stats.isFile() && this.supportedFiles[entry]) {
@@ -148,7 +163,7 @@ class SuperConfused {
 
     async scanFile(filePath) {
         const fileName = path.basename(filePath);
-        
+
         if (!this.supportedFiles[fileName]) {
             return;
         }
@@ -174,12 +189,12 @@ class SuperConfused {
                 ...packageData.optionalDependencies
             };
 
-            for (const [name, version] of Object.entries(dependencies || {})) {
+            await Promise.all(Object.entries(dependencies || {}).map(async ([name, version]) => {
                 if (this.isPotentiallyVulnerable(name)) {
                     const exists = await this.checkNpmPackageExists(name);
                     this.addResult(filePath, 'npm', name, version, exists);
                 }
-            }
+            }));
         } catch (error) {
             if (!this.jsonMode) {
                 console.error(`Error parsing package.json: ${error.message}`);
@@ -191,13 +206,13 @@ class SuperConfused {
         try {
             const lockData = JSON.parse(content);
             const dependencies = lockData.dependencies || {};
-            
-            for (const [name, info] of Object.entries(dependencies)) {
+
+            await Promise.all(Object.entries(dependencies).map(async ([name, info]) => {
                 if (this.isPotentiallyVulnerable(name)) {
                     const exists = await this.checkNpmPackageExists(name);
                     this.addResult(filePath, 'npm', name, info.version, exists);
                 }
-            }
+            }));
         } catch (error) {
             if (!this.jsonMode) {
                 console.error(`Error parsing package-lock.json: ${error.message}`);
@@ -207,181 +222,172 @@ class SuperConfused {
 
     async scanYarnLock(filePath, content) {
         const lines = content.split('\n');
-        const packages = new Set();
-        
+        const packages = new Map(); // To store name -> version
+
+        let currentPackage = null;
         for (const line of lines) {
-            const match = line.match(/^"?([^@\s]+)@/);
-            if (match && this.isPotentiallyVulnerable(match[1])) {
-                packages.add(match[1]);
+            const trimmed = line.trim();
+            if (trimmed.endsWith(':') && trimmed.startsWith('"')) {
+                // New package entry like "@scope/package@version":
+                currentPackage = trimmed.slice(1, -2).split('@')[0]; // Extract name
+            } else if (trimmed.startsWith('version ')) {
+                if (currentPackage) {
+                    const version = trimmed.split(' ')[1].replace(/"/g, '');
+                    packages.set(currentPackage, version);
+                }
             }
         }
 
-        for (const packageName of packages) {
-            const exists = await this.checkNpmPackageExists(packageName);
-            this.addResult(filePath, 'npm', packageName, 'unknown', exists);
-        }
+        await Promise.all(Array.from(packages.entries()).map(async ([packageName, version]) => {
+            if (this.isPotentiallyVulnerable(packageName)) {
+                const exists = await this.checkNpmPackageExists(packageName);
+                this.addResult(filePath, 'npm', packageName, version, exists);
+            }
+        }));
     }
 
     async scanRequirementsTxt(filePath, content) {
         const lines = content.split('\n');
-        
-        for (const line of lines) {
+
+        await Promise.all(lines.map(async (line) => {
             const trimmed = line.trim();
             if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('-')) {
-                // Match various requirements.txt formats:
-                // package==1.0.0
-                // package>=1.0.0
-                // package~=1.0.0
-                // package!=1.0.0
-                // package<=1.0.0
-                // package>1.0.0
-                // package<1.0.0
-                // package[extra]==1.0.0
-                // package
-                
                 let packageName, version = 'unknown';
-                
-                // Try to match package with version specifiers
+
                 const versionMatch = trimmed.match(/^([a-zA-Z0-9\-_\.]+(?:\[[^\]]*\])?)\s*([><=!~]+)\s*([^;,\s]+)/);
                 if (versionMatch) {
-                    packageName = versionMatch[1].replace(/\[.*\]/, ''); // Remove extras like [dev]
-                    const operator = versionMatch[2];
-                    const versionNumber = versionMatch[3];
-                    version = `${operator}${versionNumber}`;
+                    packageName = versionMatch[1].replace(/\[.*\]/, '');
+                    version = `${versionMatch[2]}${versionMatch[3]}`;
                 } else {
-                    // Try to match package without version
                     const packageMatch = trimmed.match(/^([a-zA-Z0-9\-_\.]+)/);
                     if (packageMatch) {
                         packageName = packageMatch[1];
-                        version = 'unknown';
                     } else {
-                        continue;
+                        return;
                     }
                 }
-                
+
                 if (packageName && this.isPotentiallyVulnerable(packageName)) {
                     const exists = await this.checkPyPiPackageExists(packageName);
                     this.addResult(filePath, 'pypi', packageName, version, exists);
                 }
             }
-        }
+        }));
     }
 
     async scanPyprojectToml(filePath, content) {
         const lines = content.split('\n');
         let inDependencies = false;
         let inOptionalDependencies = false;
-        
-        for (const line of lines) {
+        let inPoetryDependencies = false;
+
+        const promises = [];
+        lines.forEach((line) => {
             const trimmed = line.trim();
-            
-            // Check for dependencies section
-            if (trimmed === 'dependencies = [') {
+
+            // Standard [project.dependencies]
+            if (trimmed === 'dependencies = [' || trimmed.startsWith('dependencies = [')) {
                 inDependencies = true;
-                inOptionalDependencies = false;
-                continue;
-            }
-            
-            // Check for optional-dependencies section
-            if (trimmed.includes('optional-dependencies') && trimmed.includes('[')) {
+                inPoetryDependencies = false;
+            } else if (trimmed.includes('optional-dependencies') && trimmed.includes('[')) {
                 inOptionalDependencies = true;
                 inDependencies = false;
-                continue;
-            }
-            
-            // Check for end of section
-            if (trimmed === ']' && (inDependencies || inOptionalDependencies)) {
+            } else if (trimmed === ']') {
                 inDependencies = false;
                 inOptionalDependencies = false;
-                continue;
             }
-            
-            // Parse dependencies with version extraction
+
+            // Poetry [tool.poetry.dependencies]
+            if (trimmed === '[tool.poetry.dependencies]') {
+                inPoetryDependencies = true;
+                inDependencies = false;
+            } else if (trimmed.startsWith('[') && inPoetryDependencies) {
+                inPoetryDependencies = false;
+            }
+
+            // Parse standard dependencies
             if ((inDependencies || inOptionalDependencies) && trimmed.includes('"')) {
-                // Match patterns like:
-                // "requests>=2.25.1"
-                // "flask==2.0.0"
-                // "django~=4.0"
-                // "requests[security]>=2.25.1"
-                // "requests"
-                
                 let packageName, version = 'unknown';
-                
-                // Try to match dependency with version
+
                 const depWithVersionMatch = trimmed.match(/"([a-zA-Z0-9\-_\.]+)(?:\[[^\]]*\])?\s*([><=!~]+)\s*([^"]+)"/);
                 if (depWithVersionMatch) {
                     packageName = depWithVersionMatch[1];
-                    const operator = depWithVersionMatch[2];
-                    const versionNumber = depWithVersionMatch[3];
-                    version = `${operator}${versionNumber}`;
+                    version = `${depWithVersionMatch[2]}${depWithVersionMatch[3]}`;
                 } else {
-                    // Try to match dependency without version
                     const depMatch = trimmed.match(/"([a-zA-Z0-9\-_\.]+)(?:\[[^\]]*\])?"/);
                     if (depMatch) {
                         packageName = depMatch[1];
-                        version = 'unknown';
                     }
                 }
-                
+
                 if (packageName && this.isPotentiallyVulnerable(packageName)) {
-                    const exists = await this.checkPyPiPackageExists(packageName);
-                    this.addResult(filePath, 'pypi', packageName, version, exists);
+                    promises.push(this.checkPyPiPackageExists(packageName).then(exists => {
+                        this.addResult(filePath, 'pypi', packageName, version, exists);
+                    }));
                 }
             }
-            
-            // Also check for [project] dependencies format (single line)
+
+            // Parse Poetry dependencies
+            if (inPoetryDependencies && trimmed.includes('=')) {
+                const match = trimmed.match(/^([a-zA-Z0-9\-_\.]+)\s*=\s*(.+)/);
+                if (match) {
+                    const packageName = match[1];
+                    let version = match[2].trim().replace(/["']/g, '');
+                    if (version.startsWith('{')) {
+                        // Handle { version = "^1.0" }
+                        const versionMatch = version.match(/version\s*=\s*["']([^"']+)["']/);
+                        if (versionMatch) version = versionMatch[1];
+                    }
+                    if (this.isPotentiallyVulnerable(packageName)) {
+                        promises.push(this.checkPyPiPackageExists(packageName).then(exists => {
+                            this.addResult(filePath, 'pypi', packageName, version, exists);
+                        }));
+                    }
+                }
+            }
+
+            // Handle single-line dependencies
             if (trimmed.startsWith('dependencies') && trimmed.includes('=') && trimmed.includes('[')) {
-                // Handle single-line dependencies array
                 const depsMatch = trimmed.match(/dependencies\s*=\s*\[(.*)\]/);
                 if (depsMatch) {
                     const depsString = depsMatch[1];
                     const deps = depsString.split(',');
-                    
-                    for (const dep of deps) {
+
+                    deps.forEach(dep => {
                         const cleanDep = dep.trim().replace(/['"]/g, '');
                         let packageName, version = 'unknown';
-                        
-                        // Try to extract version from single-line format
+
                         const versionMatch = cleanDep.match(/^([a-zA-Z0-9\-_\.]+)(?:\[[^\]]*\])?\s*([><=!~]+)\s*(.+)/);
                         if (versionMatch) {
                             packageName = versionMatch[1];
-                            const operator = versionMatch[2];
-                            const versionNumber = versionMatch[3];
-                            version = `${operator}${versionNumber}`;
+                            version = `${versionMatch[2]}${versionMatch[3]}`;
                         } else {
                             const packageMatch = cleanDep.match(/^([a-zA-Z0-9\-_\.]+)/);
                             if (packageMatch) {
                                 packageName = packageMatch[1];
-                                version = 'unknown';
                             }
                         }
-                        
+
                         if (packageName && this.isPotentiallyVulnerable(packageName)) {
-                            const exists = await this.checkPyPiPackageExists(packageName);
-                            this.addResult(filePath, 'pypi', packageName, version, exists);
+                            promises.push(this.checkPyPiPackageExists(packageName).then(exists => {
+                                this.addResult(filePath, 'pypi', packageName, version, exists);
+                            }));
                         }
-                    }
+                    });
                 }
             }
-        }
+        });
+        await Promise.all(promises);
     }
 
     async scanSbom(filePath, content) {
         try {
             const sbomData = JSON.parse(content);
-            
-            // Detect SBOM format and extract components
-            if (sbomData.bomFormat === 'CycloneDX') {
+
+            if (sbomData.bomFormat === 'CycloneDX' || sbomData.components) {
                 await this.scanCycloneDx(filePath, sbomData);
-            } else if (sbomData.spdxVersion) {
+            } else if (sbomData.spdxVersion || sbomData.packages) {
                 await this.scanSpdx(filePath, sbomData);
-            } else {
-                // Try to auto-detect based on structure
-                if (sbomData.components) {
-                    await this.scanCycloneDx(filePath, sbomData);
-                } else if (sbomData.packages) {
-                    await this.scanSpdx(filePath, sbomData);
-                }
             }
         } catch (error) {
             if (!this.jsonMode) {
@@ -392,107 +398,61 @@ class SuperConfused {
 
     async scanCycloneDx(filePath, sbomData) {
         const components = sbomData.components || [];
-        
-        for (const component of components) {
+
+        await Promise.all(components.map(async (component) => {
             if (component.name && component.type === 'library') {
                 const packageName = component.name;
                 const version = component.version || 'unknown';
                 const ecosystem = this.detectEcosystemFromPurl(component.purl) || 'unknown';
-                
+
                 if (this.isPotentiallyVulnerable(packageName)) {
-                    let exists = 'unknown';
-                    
-                    // Check package existence based on ecosystem
-                    if (ecosystem === 'npm') {
-                        exists = await this.checkNpmPackageExists(packageName);
-                    } else if (ecosystem === 'pypi') {
-                        exists = await this.checkPyPiPackageExists(packageName);
-                    } else if (ecosystem === 'cargo') {
-                        exists = await this.checkCratesIoPackageExists(packageName);
-                    } else if (ecosystem === 'packagist') {
-                        exists = await this.checkPackagistPackageExists(packageName);
-                    } else if (ecosystem === 'gem') {
-                        exists = await this.checkRubyGemsPackageExists(packageName);
-                    } else if (ecosystem === 'maven') {
-                        exists = await this.checkMavenPackageExists(packageName);
-                    }
-                    
+                    const exists = await this.checkPackageExistsByEcosystem(ecosystem, packageName);
                     this.addResult(filePath, ecosystem, packageName, version, exists);
                 }
             }
-        }
+        }));
     }
 
     async scanSpdx(filePath, sbomData) {
         const packages = sbomData.packages || [];
-        
-        for (const pkg of packages) {
+
+        await Promise.all(packages.map(async (pkg) => {
             if (pkg.name && pkg.name !== sbomData.name) {
                 const packageName = pkg.name;
                 const version = pkg.versionInfo || 'unknown';
                 const ecosystem = this.detectEcosystemFromSpdx(pkg) || 'unknown';
-                
+
                 if (this.isPotentiallyVulnerable(packageName)) {
-                    let exists = 'unknown';
-                    
-                    // Check package existence based on ecosystem
-                    if (ecosystem === 'npm') {
-                        exists = await this.checkNpmPackageExists(packageName);
-                    } else if (ecosystem === 'pypi') {
-                        exists = await this.checkPyPiPackageExists(packageName);
-                    } else if (ecosystem === 'cargo') {
-                        exists = await this.checkCratesIoPackageExists(packageName);
-                    } else if (ecosystem === 'packagist') {
-                        exists = await this.checkPackagistPackageExists(packageName);
-                    } else if (ecosystem === 'gem') {
-                        exists = await this.checkRubyGemsPackageExists(packageName);
-                    } else if (ecosystem === 'maven') {
-                        exists = await this.checkMavenPackageExists(packageName);
-                    }
-                    
+                    const exists = await this.checkPackageExistsByEcosystem(ecosystem, packageName);
                     this.addResult(filePath, ecosystem, packageName, version, exists);
                 }
             }
-        }
+        }));
     }
 
     async scanSbomXml(filePath, content) {
-        // Basic XML parsing for CycloneDX XML format
         const componentRegex = /<component[^>]*type="library"[^>]*>[\s\S]*?<name>([^<]+)<\/name>[\s\S]*?(?:<version>([^<]+)<\/version>)?[\s\S]*?(?:<purl>([^<]+)<\/purl>)?[\s\S]*?<\/component>/g;
         let match;
-        
+
+        const promises = [];
         while ((match = componentRegex.exec(content)) !== null) {
             const packageName = match[1];
             const version = match[2] || 'unknown';
             const purl = match[3];
             const ecosystem = this.detectEcosystemFromPurl(purl) || 'unknown';
-            
+
             if (this.isPotentiallyVulnerable(packageName)) {
-                let exists = 'unknown';
-                
-                // Check package existence based on ecosystem
-                if (ecosystem === 'npm') {
-                    exists = await this.checkNpmPackageExists(packageName);
-                } else if (ecosystem === 'pypi') {
-                    exists = await this.checkPyPiPackageExists(packageName);
-                } else if (ecosystem === 'cargo') {
-                    exists = await this.checkCratesIoPackageExists(packageName);
-                } else if (ecosystem === 'packagist') {
-                    exists = await this.checkPackagistPackageExists(packageName);
-                } else if (ecosystem === 'gem') {
-                    exists = await this.checkRubyGemsPackageExists(packageName);
-                } else if (ecosystem === 'maven') {
-                    exists = await this.checkMavenPackageExists(packageName);
-                }
-                
-                this.addResult(filePath, ecosystem, packageName, version, exists);
+                promises.push(this.checkPackageExistsByEcosystem(ecosystem, packageName).then(exists => {
+                    this.addResult(filePath, ecosystem, packageName, version, exists);
+                }));
             }
         }
+        await Promise.all(promises);
     }
 
     detectEcosystemFromPurl(purl) {
         if (!purl) return null;
-        
+
         if (purl.startsWith('pkg:npm/')) return 'npm';
         if (purl.startsWith('pkg:pypi/')) return 'pypi';
         if (purl.startsWith('pkg:cargo/')) return 'cargo';
@@ -500,98 +460,102 @@ class SuperConfused {
         if (purl.startsWith('pkg:gem/')) return 'gem';
         if (purl.startsWith('pkg:maven/')) return 'maven';
         if (purl.startsWith('pkg:golang/')) return 'go';
-        
+
         return null;
     }
 
     detectEcosystemFromSpdx(pkg) {
-        // Try to detect ecosystem from SPDX package info
         const downloadLocation = pkg.downloadLocation || '';
         const packageFileName = pkg.packageFileName || '';
-        const homepage = pkg.homepage || '';
-        
-        if (downloadLocation.includes('npmjs.org') || packageFileName.includes('.tgz')) {
-            return 'npm';
-        }
-        if (downloadLocation.includes('pypi.org') || downloadLocation.includes('files.pythonhosted.org')) {
-            return 'pypi';
-        }
-        if (downloadLocation.includes('crates.io')) {
-            return 'cargo';
-        }
-        if (downloadLocation.includes('packagist.org')) {
-            return 'packagist';
-        }
-        if (downloadLocation.includes('rubygems.org')) {
-            return 'gem';
-        }
-        if (downloadLocation.includes('maven') || packageFileName.includes('.jar')) {
-            return 'maven';
-        }
-        
+
+        if (downloadLocation.includes('npmjs.org') || packageFileName.includes('.tgz')) return 'npm';
+        if (downloadLocation.includes('pypi.org') || downloadLocation.includes('files.pythonhosted.org')) return 'pypi';
+        if (downloadLocation.includes('crates.io')) return 'cargo';
+        if (downloadLocation.includes('packagist.org')) return 'packagist';
+        if (downloadLocation.includes('rubygems.org')) return 'gem';
+        if (downloadLocation.includes('maven') || packageFileName.includes('.jar')) return 'maven';
+        if (downloadLocation.includes('proxy.golang.org') || downloadLocation.includes('pkg.go.dev')) return 'go';
+
         return null;
     }
 
     async scanGoMod(filePath, content) {
         const lines = content.split('\n');
-        
-        for (const line of lines) {
+
+        await Promise.all(lines.map(async (line) => {
             const trimmed = line.trim();
-            const requireMatch = trimmed.match(/^\s*([^\s]+)\s+v/);
-            
+            const requireMatch = trimmed.match(/^\s*([^\s]+)\s+v(.*)$/);
+
             if (requireMatch) {
                 const moduleName = requireMatch[1];
+                const version = requireMatch[2] || 'unknown';
                 if (this.isPotentiallyVulnerable(moduleName)) {
-                    this.addResult(filePath, 'go', moduleName, 'unknown', 'unknown');
+                    const exists = await this.checkGoPackageExists(moduleName);
+                    this.addResult(filePath, 'go', moduleName, version, exists);
                 }
             }
-        }
+        }));
     }
 
     async scanGoSum(filePath, content) {
         const lines = content.split('\n');
-        const modules = new Set();
-        
-        for (const line of lines) {
+        const modules = new Map(); // name -> version
+
+        lines.forEach(line => {
             const parts = line.split(' ');
             if (parts.length >= 2) {
-                const modulePath = parts[0].split('/v')[0];
+                const modulePath = parts[0];
+                const version = parts[1] || 'unknown';
                 if (this.isPotentiallyVulnerable(modulePath)) {
-                    modules.add(modulePath);
+                    if (!modules.has(modulePath)) {
+                        modules.set(modulePath, version);
+                    }
                 }
             }
-        }
+        });
 
-        for (const moduleName of modules) {
-            this.addResult(filePath, 'go', moduleName, 'unknown', 'unknown');
-        }
+        await Promise.all(Array.from(modules.entries()).map(async ([moduleName, version]) => {
+            const exists = await this.checkGoPackageExists(moduleName);
+            this.addResult(filePath, 'go', moduleName, version, exists);
+        }));
     }
 
     async scanCargoToml(filePath, content) {
         const lines = content.split('\n');
         let inDependencies = false;
-        
-        for (const line of lines) {
+
+        const promises = [];
+        lines.forEach(line => {
             const trimmed = line.trim();
-            
+
             if (trimmed === '[dependencies]' || trimmed === '[dev-dependencies]') {
                 inDependencies = true;
-                continue;
+                return;
             }
-            
-            if (trimmed.startsWith('[') && trimmed !== '[dependencies]' && trimmed !== '[dev-dependencies]') {
+
+            if (trimmed.startsWith('[') && inDependencies) {
                 inDependencies = false;
-                continue;
+                return;
             }
-            
+
             if (inDependencies && trimmed.includes('=')) {
-                const packageMatch = trimmed.match(/^([a-zA-Z0-9\-_]+)\s*=/);
-                if (packageMatch && this.isPotentiallyVulnerable(packageMatch[1])) {
-                    const exists = await this.checkCratesIoPackageExists(packageMatch[1]);
-                    this.addResult(filePath, 'crates.io', packageMatch[1], 'unknown', exists);
+                const match = trimmed.match(/^([a-zA-Z0-9\-_]+)\s*=\s*(.+)/);
+                if (match) {
+                    const packageName = match[1];
+                    let version = match[2].trim().replace(/["']/g, '');
+                    if (version.startsWith('{')) {
+                        const versionMatch = version.match(/version\s*=\s*["']([^"']+)["']/);
+                        if (versionMatch) version = versionMatch[1];
+                    }
+                    if (this.isPotentiallyVulnerable(packageName)) {
+                        promises.push(this.checkCratesIoPackageExists(packageName).then(exists => {
+                            this.addResult(filePath, 'crates.io', packageName, version, exists);
+                        }));
+                    }
                 }
             }
-        }
+        });
+        await Promise.all(promises);
     }
 
     async scanComposerJson(filePath, content) {
@@ -602,12 +566,12 @@ class SuperConfused {
                 ...composerData['require-dev']
             };
 
-            for (const [name, version] of Object.entries(dependencies || {})) {
+            await Promise.all(Object.entries(dependencies || {}).map(async ([name, version]) => {
                 if (name !== 'php' && this.isPotentiallyVulnerable(name)) {
                     const exists = await this.checkPackagistPackageExists(name);
                     this.addResult(filePath, 'packagist', name, version, exists);
                 }
-            }
+            }));
         } catch (error) {
             if (!this.jsonMode) {
                 console.error(`Error parsing composer.json: ${error.message}`);
@@ -617,24 +581,16 @@ class SuperConfused {
 
     async scanGemfile(filePath, content) {
         const lines = content.split('\n');
-        
-        for (const line of lines) {
+
+        await Promise.all(lines.map(async (line) => {
             const trimmed = line.trim();
-            
-            // Skip comments and empty lines
-            if (!trimmed || trimmed.startsWith('#')) {
-                continue;
-            }
-            
-            // Match various gem declaration formats and capture version:
-            // gem 'name'
-            // gem "name"  
-            // gem 'name', 'version'
-            // gem 'name', version: 'x.x.x'
-            // gem 'name', '~> x.x.x'
+            if (!trimmed || trimmed.startsWith('#')) return;
+
             let gemMatch, version = 'unknown';
-            
-            // Try to match gem with quoted version: gem 'name', 'version'
+
+            // gem 'name', 'version', github: 'repo' - skip if git/source
+            if (trimmed.includes('git') || trimmed.includes('path')) return;
+
             gemMatch = trimmed.match(/gem\s+['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]/);
             if (gemMatch) {
                 const packageName = gemMatch[1];
@@ -643,10 +599,9 @@ class SuperConfused {
                     const exists = await this.checkRubyGemsPackageExists(packageName);
                     this.addResult(filePath, 'rubygems', packageName, version, exists);
                 }
-                continue;
+                return;
             }
-            
-            // Try to match gem with version: syntax: gem 'name', version: 'x.x.x'
+
             gemMatch = trimmed.match(/gem\s+['"]([^'"]+)['"]\s*,\s*version:\s*['"]([^'"]+)['"]/);
             if (gemMatch) {
                 const packageName = gemMatch[1];
@@ -655,10 +610,9 @@ class SuperConfused {
                     const exists = await this.checkRubyGemsPackageExists(packageName);
                     this.addResult(filePath, 'rubygems', packageName, version, exists);
                 }
-                continue;
+                return;
             }
-            
-            // Try to match gem with hash syntax: gem 'name', '~> x.x.x', require: false
+
             gemMatch = trimmed.match(/gem\s+['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"](?:\s*,.*)?/);
             if (gemMatch) {
                 const packageName = gemMatch[1];
@@ -667,56 +621,47 @@ class SuperConfused {
                     const exists = await this.checkRubyGemsPackageExists(packageName);
                     this.addResult(filePath, 'rubygems', packageName, version, exists);
                 }
-                continue;
+                return;
             }
-            
-            // Fall back to simple gem declaration without version
+
             gemMatch = trimmed.match(/gem\s+['"]([^'"]+)['"](?:\s*$|\s*,\s*(?!['"]))/);
             if (gemMatch && this.isPotentiallyVulnerable(gemMatch[1])) {
                 const exists = await this.checkRubyGemsPackageExists(gemMatch[1]);
                 this.addResult(filePath, 'rubygems', gemMatch[1], 'unknown', exists);
             }
-        }
+        }));
     }
 
     async scanPomXml(filePath, content) {
-        // First, find all dependency blocks
         const dependencyBlocks = content.match(/<dependency[^>]*>[\s\S]*?<\/dependency>/g) || [];
-        
-        for (const block of dependencyBlocks) {
-            // Extract groupId, artifactId, and version from each block
+
+        await Promise.all(dependencyBlocks.map(async (block) => {
             const groupIdMatch = block.match(/<groupId>([^<]+)<\/groupId>/);
             const artifactIdMatch = block.match(/<artifactId>([^<]+)<\/artifactId>/);
             const versionMatch = block.match(/<version>([^<]+)<\/version>/);
-            
+
             if (groupIdMatch && artifactIdMatch) {
                 const groupId = groupIdMatch[1].trim();
                 const artifactId = artifactIdMatch[1].trim();
                 const version = versionMatch ? versionMatch[1].trim() : 'unknown';
                 const fullName = `${groupId}:${artifactId}`;
-                
-                if (this.isPotentiallyVulnerable(artifactId)) {
+
+                if (this.isPotentiallyVulnerable(fullName)) {
                     const exists = await this.checkMavenPackageExists(fullName);
                     this.addResult(filePath, 'maven', fullName, version, exists);
                 }
             }
-        }
+        }));
     }
 
     async scanGradle(filePath, content) {
         const lines = content.split('\n');
-        
-        for (const line of lines) {
+
+        await Promise.all(lines.map(async (line) => {
             const trimmed = line.trim();
-            
-            // Match various Gradle dependency formats with versions:
-            // implementation 'group:artifact:version'
-            // implementation "group:artifact:version"
-            // implementation group: 'group', name: 'artifact', version: 'version'
-            
+
             let depMatch, groupId, artifactId, version = 'unknown';
-            
-            // Try to match standard format: implementation 'group:artifact:version'
+
             depMatch = trimmed.match(/(?:implementation|compile|api|testImplementation|runtimeOnly|compileOnly|testCompileOnly|testRuntimeOnly)\s+['"]([^'"]+)['"]/);
             if (depMatch) {
                 const parts = depMatch[1].split(':');
@@ -724,199 +669,203 @@ class SuperConfused {
                     groupId = parts[0];
                     artifactId = parts[1];
                     version = parts[2] || 'unknown';
-                    const fullName = parts.length >= 3 ? `${groupId}:${artifactId}` : depMatch[1];
-                    
-                    if (this.isPotentiallyVulnerable(artifactId)) {
+                    const fullName = `${groupId}:${artifactId}`;
+                    if (this.isPotentiallyVulnerable(fullName)) {
                         const exists = await this.checkMavenPackageExists(fullName);
                         this.addResult(filePath, 'maven', fullName, version, exists);
                     }
                 }
-                continue;
+                return;
             }
-            
-            // Try to match map syntax: implementation group: 'group', name: 'artifact', version: 'version'
+
             const mapMatch = trimmed.match(/(?:implementation|compile|api|testImplementation|runtimeOnly|compileOnly|testCompileOnly|testRuntimeOnly)\s+group:\s*['"]([^'"]+)['"],?\s*name:\s*['"]([^'"]+)['"](?:,?\s*version:\s*['"]([^'"]+)['"])?/);
             if (mapMatch) {
                 groupId = mapMatch[1];
                 artifactId = mapMatch[2];
                 version = mapMatch[3] || 'unknown';
                 const fullName = `${groupId}:${artifactId}`;
-                
-                if (this.isPotentiallyVulnerable(artifactId)) {
+                if (this.isPotentiallyVulnerable(fullName)) {
                     const exists = await this.checkMavenPackageExists(fullName);
                     this.addResult(filePath, 'maven', fullName, version, exists);
                 }
-                continue;
+                return;
             }
-            
-            // Try to match alternative map syntax with different order
+
             const altMapMatch = trimmed.match(/(?:implementation|compile|api|testImplementation|runtimeOnly|compileOnly|testCompileOnly|testRuntimeOnly)\s+name:\s*['"]([^'"]+)['"],?\s*group:\s*['"]([^'"]+)['"](?:,?\s*version:\s*['"]([^'"]+)['"])?/);
             if (altMapMatch) {
                 artifactId = altMapMatch[1];
                 groupId = altMapMatch[2];
                 version = altMapMatch[3] || 'unknown';
                 const fullName = `${groupId}:${artifactId}`;
-                
-                if (this.isPotentiallyVulnerable(artifactId)) {
+                if (this.isPotentiallyVulnerable(fullName)) {
                     const exists = await this.checkMavenPackageExists(fullName);
                     this.addResult(filePath, 'maven', fullName, version, exists);
                 }
             }
-        }
+        }));
     }
 
     isPotentiallyVulnerable(packageName) {
-        if (packageName.includes('://') || packageName.startsWith('git+')) {
+        if (packageName.includes('://') || packageName.startsWith('git+') || packageName.includes('github:') || packageName.includes('path:')) {
             return false;
         }
-        
-        // For scoped packages, we still want to check them, but with different logic
-        if (packageName.startsWith('@')) {
-            // Only check scoped packages that look suspicious
-            const scopedSuspiciousPatterns = [
-                /^@[a-z0-9]+\/[a-z0-9]{3,8}$/i,  // short package names in scope
-                /^@[a-z0-9]+\/(lib|utils?|helper|common|core|base|tools?|sdk)$/i,  // generic names
-                /^@[a-z0-9]+\/(test|demo|example|sample)[-_]?/i,  // test/demo packages
-            ];
-            return scopedSuspiciousPatterns.some(pattern => pattern.test(packageName));
-        }
-        
-        const suspiciousPatterns = [
-            /^[a-z0-9]+[-_][a-z0-9]+$/i,  // patterns like "6mile-test", "test-utils", etc.
-            /^[a-z0-9]{3,8}$/i,  // short alphanumeric names
-            /^(lib|utils?|helper|common|core|base|tools?|sdk)$/i,  // generic names
-            /^(test|demo|example|sample)[-_]?/i,  // test/demo packages
-            /^[a-z0-9]*[-_]?(test|demo|example|sample)$/i,  // packages ending with test/demo
-            /^[0-9]+[a-z]+[-_]?[a-z0-9]*$/i,  // packages starting with numbers like "6mile"
-        ];
 
         const wellKnownPackages = [
-            'react', 'vue', 'angular', 'lodash', 'express', 'axios', 'moment',
-            'jquery', 'bootstrap', 'webpack', 'babel', 'eslint', 'jest', 'mocha',
-            'typescript', 'commander', 'chalk', 'inquirer', 'yargs', 'fs-extra',
-            'rimraf', 'glob', 'mkdirp', 'debug', 'semver', 'uuid', 'cors',
-            'dotenv', 'nodemon', 'concurrently', 'cross-env', 'husky', 'lint-staged',
-            'rails', 'sqlite3', 'pg', 'mysql2', 'puma', 'sidekiq', 'devise', 'rspec'
+            'react', 'vue', 'angular', 'lodash', 'express', 'axios', 'moment', 'jquery', 'bootstrap',
+            'webpack', 'babel', 'eslint', 'jest', 'mocha', 'typescript', 'commander', 'chalk', 'inquirer',
+            'yargs', 'fs-extra', 'rimraf', 'glob', 'mkdirp', 'debug', 'semver', 'uuid', 'cors', 'dotenv',
+            'nodemon', 'concurrently', 'cross-env', 'husky', 'lint-staged', 'requests', 'flask', 'django',
+            'numpy', 'pandas', 'matplotlib', 'scipy', 'tensorflow', 'pytorch', 'serde', 'tokio', 'actix',
+            'rails', 'sqlite3', 'pg', 'mysql2', 'puma', 'sidekiq', 'devise', 'rspec', 'spring-boot-starter',
+            'hibernate', 'junit', 'gson', 'log4j'
         ];
 
         if (wellKnownPackages.includes(packageName.toLowerCase())) {
             return false;
         }
 
-        return suspiciousPatterns.some(pattern => pattern.test(packageName)) || 
-               packageName.length <= 4;
+        if (packageName.startsWith('@')) {
+            // Special patterns for scoped packages
+            const scopedSuspiciousPatterns = [
+                /^@[a-z0-9]+\/[a-z0-9]{3,10}$/i,
+                /^@[a-z0-9]+\/(lib|utils?|helper|common|core|base|tools?|sdk|internal|private)$/i,
+                /^@[a-z0-9]+\/(test|demo|example|sample|internal|private)[-_]?/i,
+                /^@[a-z0-9]+\/[a-z0-9]*[-_]?(test|demo|example|sample|internal|private)$/i,
+                /^@[0-9]+[a-z]+\/[a-z0-9]*$/i,
+                /^@[a-z0-9]+\/[-_]internal[-_]/i,
+                /^@[a-z0-9]+\/[-_]private[-_]/i
+            ];
+            return scopedSuspiciousPatterns.some(pattern => pattern.test(packageName)) || packageName.length <= 10;
+        }
+
+        // General patterns for non-scoped
+        const suspiciousPatterns = [
+            /^[a-z0-9]+[-_][a-z0-9]+$/i,
+            /^[a-z0-9]{3,10}$/i,
+            /^(lib|utils?|helper|common|core|base|tools?|sdk|internal|private)$/i,
+            /^(test|demo|example|sample|internal|private)[-_]?/i,
+            /^[a-z0-9]*[-_]?(test|demo|example|sample|internal|private)$/i,
+            /^[0-9]+[a-z]+[-_]?[a-z0-9]*$/i,
+            /[-_]internal[-_]/i,
+            /[-_]private[-_]/i
+        ];
+
+        return suspiciousPatterns.some(pattern => pattern.test(packageName)) || packageName.length <= 4;
+    }
+
+    async checkPackageExistsByEcosystem(ecosystem, packageName) {
+        switch (ecosystem) {
+            case 'npm':
+                return this.checkNpmPackageExists(packageName);
+            case 'pypi':
+                return this.checkPyPiPackageExists(packageName);
+            case 'cargo':
+                return this.checkCratesIoPackageExists(packageName);
+            case 'packagist':
+                return this.checkPackagistPackageExists(packageName);
+            case 'gem':
+                return this.checkRubyGemsPackageExists(packageName);
+            case 'maven':
+                return this.checkMavenPackageExists(packageName);
+            case 'go':
+                return this.checkGoPackageExists(packageName);
+            default:
+                return 'unknown';
+        }
     }
 
     async checkNpmPackageExists(packageName) {
-        const encodedPackageName = packageName.startsWith('@') 
-            ? packageName.replace('@', '%40')
-            : packageName;
-            
-        return this.makeHttpRequest(`https://registry.npmjs.org/${encodedPackageName}`)
-            .then(() => true)
-            .catch(() => false);
+        // No encoding for @ or /; they are valid in path
+        try {
+            await this.makeHttpRequest(`https://registry.npmjs.org/${packageName}`);
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     async checkPyPiPackageExists(packageName) {
-        return this.makeHttpRequest(`https://pypi.org/pypi/${packageName}/json`)
-            .then(() => true)
-            .catch(() => false);
+        try {
+            await this.makeHttpRequest(`https://pypi.org/pypi/${packageName}/json`);
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     async checkCratesIoPackageExists(packageName) {
-        return this.makeHttpRequest(`https://crates.io/api/v1/crates/${packageName}`)
-            .then(() => true)
-            .catch(() => false);
+        try {
+            await this.makeHttpRequest(`https://crates.io/api/v1/crates/${packageName}`);
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     async checkPackagistPackageExists(packageName) {
-        return this.makeHttpRequest(`https://packagist.org/packages/${packageName}.json`)
-            .then(() => true)
-            .catch(() => false);
+        try {
+            await this.makeHttpRequest(`https://packagist.org/packages/${packageName}.json`);
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     async checkRubyGemsPackageExists(packageName) {
-        // Clean the package name - remove any version constraints or other characters
         const cleanPackageName = packageName.replace(/[<>=!~\s]/g, '').split(',')[0].trim();
-        
         try {
             await this.makeHttpRequest(`https://rubygems.org/api/v1/gems/${cleanPackageName}.json`);
             return true;
-        } catch (error) {
-            // Try alternative endpoint format
+        } catch {
             try {
                 await this.makeHttpRequest(`https://rubygems.org/api/v1/versions/${cleanPackageName}.json`);
                 return true;
-            } catch (alternativeError) {
+            } catch {
                 return false;
             }
         }
     }
 
     async checkMavenPackageExists(packageName) {
-        // Parse groupId:artifactId format
         let groupId, artifactId;
-        
         if (packageName.includes(':')) {
-            const parts = packageName.split(':');
-            groupId = parts[0];
-            artifactId = parts[1];
+            [groupId, artifactId] = packageName.split(':');
         } else {
-            // If only artifact name is provided, we can't reliably check Maven Central
-            // Return 'unknown' for single artifact names without group
             return 'unknown';
         }
 
-        // Convert groupId dots to slashes for Maven Central API
         const groupPath = groupId.replace(/\./g, '/');
-        
-        // Try Maven Central Search API first (more reliable)
+        const metadataUrl = `https://repo1.maven.org/maven2/${groupPath}/${artifactId}/maven-metadata.xml`;
+
         try {
-            const searchUrl = `https://search.maven.org/solrsearch/select?q=g:"${groupId}"+AND+a:"${artifactId}"&rows=1&wt=json`;
-            const response = await this.makeHttpRequest(searchUrl);
-            
-            // If we get here, the request succeeded, but we need to check the response
-            return new Promise((resolve) => {
-                let data = '';
-                response.on('data', chunk => {
-                    data += chunk;
-                });
-                response.on('end', () => {
-                    try {
-                        const searchResult = JSON.parse(data);
-                        const found = searchResult.response && 
-                                     searchResult.response.numFound && 
-                                     searchResult.response.numFound > 0;
-                        resolve(found);
-                    } catch (e) {
-                        resolve(false);
-                    }
-                });
-            });
-        } catch (searchError) {
-            // Fall back to direct Maven Central repository check
-            try {
-                const repoUrl = `https://repo1.maven.org/maven2/${groupPath}/${artifactId}/maven-metadata.xml`;
-                await this.makeHttpRequest(repoUrl);
-                return true;
-            } catch (repoError) {
-                // Try alternative: check if group directory exists
-                try {
-                    const groupUrl = `https://repo1.maven.org/maven2/${groupPath}/`;
-                    await this.makeHttpRequest(groupUrl);
-                    // Group exists, but artifact might not - return false for dependency confusion potential
-                    return false;
-                } catch (groupError) {
-                    // Neither group nor artifact found
-                    return false;
-                }
-            }
+            await this.makeHttpRequest(metadataUrl);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    async checkGoPackageExists(moduleName) {
+        try {
+            const response = await this.makeHttpRequest(`https://proxy.golang.org/${moduleName}/@v/list`);
+            let data = '';
+            response.on('data', chunk => { data += chunk; });
+            await new Promise(resolve => response.on('end', resolve));
+            return data.trim() !== '';
+        } catch {
+            return false;
         }
     }
 
     makeHttpRequest(url) {
+        const parsedUrl = urlModule.parse(url);
+        const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
         return new Promise((resolve, reject) => {
-            const request = https.get(url, { timeout: 5000 }, (response) => {
+            const request = protocol.get(url, {
+                timeout: this.timeout,
+                headers: { 'User-Agent': this.userAgent }
+            }, (response) => {
                 if (response.statusCode === 200) {
                     resolve(response);
                 } else {
@@ -934,7 +883,7 @@ class SuperConfused {
 
     addResult(filePath, ecosystem, packageName, version, exists) {
         const risk = exists === false ? 'HIGH' : exists === true ? 'LOW' : 'UNKNOWN';
-        
+
         this.results.push({
             file: filePath,
             ecosystem,
@@ -948,20 +897,21 @@ class SuperConfused {
     printResults() {
         if (this.jsonMode) {
             const vulnerabilities = this.results
-                .filter(r => r.risk === 'HIGH' || r.risk === 'UNKNOWN');
-            
-            if (vulnerabilities.length > 0) {
-                const packages = vulnerabilities.map(result => ({
-                    [result.package]: result.version
+                .filter(r => r.risk === 'HIGH' || r.risk === 'UNKNOWN')
+                .map(result => ({
+                    package: result.package,
+                    version: result.version,
+                    ecosystem: result.ecosystem,
+                    file: result.file
                 }));
 
+            if (vulnerabilities.length > 0) {
                 const output = {
                     "name": "super-confused",
-                    "description": "Identify dependeny confusion in your source code",
+                    "description": "Identify dependency confusion in your source code",
                     "author": "6mile",
-                    "dependency-confused-packages": packages
+                    "dependency-confused-packages": vulnerabilities
                 };
-
                 console.log(JSON.stringify(output, null, 2));
             }
             return;
@@ -979,6 +929,7 @@ class SuperConfused {
             console.log('DEPENDENCY CONFUSION OPPORTUNITY!');
             console.log(`${result.package} (${result.ecosystem}) in ${result.file}`);
             console.log(`Version: ${result.version}`);
+            console.log(`Risk: ${result.risk}`);
         });
     }
 }
@@ -994,7 +945,7 @@ async function main() {
     } else {
         targetPath = args[0];
     }
-    
+
     if (!targetPath) {
         console.log('Usage: super-confused [--json] <path|url>');
         console.log('');
@@ -1005,8 +956,8 @@ async function main() {
         console.log('  super-confused .');
         process.exit(1);
     }
-    
-    if (!targetPath.startsWith('http://') && !targetPath.startsWith('https://') && !fs.existsSync(targetPath)) {
+
+    if (!targetPath.startsWith('http') && !fs.existsSync(targetPath)) {
         if (!jsonMode) {
             console.error(`Path does not exist: ${targetPath}`);
         }
@@ -1014,7 +965,7 @@ async function main() {
     }
 
     const scanner = new SuperConfused(jsonMode);
-    
+
     try {
         await scanner.scan(targetPath);
     } catch (error) {

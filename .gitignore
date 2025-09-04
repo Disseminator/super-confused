@@ -1,0 +1,51 @@
+# 通用忽略文件
+# 临时文件和编辑器文件
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+*.sublime-workspace
+
+# 编译和构建产物
+dist/
+build/
+*.o
+*.pyc
+__pycache__/
+*.class
+*.jar
+
+# 依赖和包管理
+node_modules/
+venv/
+env/
+*.egg-info/
+pip-wheel-metadata/
+package-lock.json
+yarn.lock
+
+# 日志和临时数据
+*.log
+*.tmp
+temp/
+logs/
+
+# 测试和覆盖率报告
+coverage/
+*.cov
+*.xml
+*.lcov
+
+# 敏感信息
+.env
+*.key
+*.pem
+*.secret
+secrets/
+
+# 项目特定忽略
+# 如果有大型测试文件、样本混淆代码等
+test_files/
+obfuscated_samples/
+output/
